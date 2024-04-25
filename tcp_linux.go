@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package tcpraw
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -28,8 +30,9 @@ var (
 
 // a message from NIC
 type message struct {
-	bts  []byte
-	addr net.Addr
+	originBufPtr *[]byte
+	bts          []byte
+	addr         net.Addr
 }
 
 // a tcp flow information of a connection pair
@@ -75,7 +78,9 @@ type TCPConn struct {
 	writeDeadline atomic.Value
 
 	// serialization
-	opts gopacket.SerializeOptions
+	opts        gopacket.SerializeOptions
+	tcpPacketCh chan *packetForChannel
+	remoteIP    net.IP
 }
 
 // lockflow locks the flow table and apply function `f` to the entry, and create one if not exist
@@ -104,7 +109,7 @@ func (conn *TCPConn) cleaner() {
 		for k, v := range conn.flowTable {
 			if time.Now().Sub(v.ts) > expire {
 				if v.conn != nil {
-					setTTL(v.conn, 64)
+					setTTL(v.conn, 128)
 					v.conn.Close()
 				}
 				delete(conn.flowTable, k)
@@ -114,11 +119,25 @@ func (conn *TCPConn) cleaner() {
 	}
 }
 
+func (conn *TCPConn) captureFlowFromChannel(tcpPacketCh chan *packetForChannel, handle *net.IPConn, remoteIP net.IP) {
+	// log.Printf("start capture flow from channel %v", tcpPacketCh)
+	for {
+		select {
+		case packet := <-tcpPacketCh:
+			// log.Printf("recv packet from channel")
+			conn.handleTCPPacket(handle, packet, remoteIP)
+		case <-conn.die:
+			return
+		}
+	}
+}
+
 // captureFlow capture every inbound packets based on rules of BPF
 func (conn *TCPConn) captureFlow(handle *net.IPConn, port int) {
-	buf := make([]byte, 2048)
 	opt := gopacket.DecodeOptions{NoCopy: true, Lazy: true}
 	for {
+		bufPtr := bufferPool.Get().(*[]byte)
+		buf := *bufPtr
 		n, addr, err := handle.ReadFromIP(buf)
 		if err != nil {
 			return
@@ -137,43 +156,47 @@ func (conn *TCPConn) captureFlow(handle *net.IPConn, port int) {
 			continue
 		}
 
-		// address building
-		var src net.TCPAddr
-		src.IP = addr.IP
-		src.Port = int(tcp.SrcPort)
+		conn.handleTCPPacket(handle, &packetForChannel{tcp, bufPtr}, addr.IP)
+	}
+}
 
-		var orphan bool
-		// flow maintaince
-		conn.lockflow(&src, func(e *tcpFlow) {
-			if e.conn == nil { // make sure it's related to net.TCPConn
-				orphan = true // mark as orphan if it's not related net.TCPConn
-			}
+func (conn *TCPConn) handleTCPPacket(handle *net.IPConn, packet *packetForChannel, remoteIP net.IP) {
+	tcp := packet.tcp
+	// address building
+	var src net.TCPAddr
+	src.IP = remoteIP
+	src.Port = int(tcp.SrcPort)
 
-			// to keep track of TCP header related to this source
-			e.ts = time.Now()
-			if tcp.ACK {
-				e.seq = tcp.Ack
-			}
-			if tcp.SYN {
-				e.ack = tcp.Seq + 1
-			}
-			if tcp.PSH {
-				if e.ack == tcp.Seq {
-					e.ack = tcp.Seq + uint32(len(tcp.Payload))
-				}
-			}
-			e.handle = handle
-		})
+	var orphan bool
+	// flow maintaince
+	conn.lockflow(&src, func(e *tcpFlow) {
+		if e.conn == nil { // make sure it's related to net.TCPConn
+			orphan = true // mark as orphan if it's not related net.TCPConn
+		}
 
-		// push data if it's not orphan
-		if !orphan && tcp.PSH {
-			payload := make([]byte, len(tcp.Payload))
-			copy(payload, tcp.Payload)
-			select {
-			case conn.chMessage <- message{payload, &src}:
-			case <-conn.die:
-				return
+		// to keep track of TCP header related to this source
+		e.ts = time.Now()
+		if tcp.ACK {
+			e.seq = tcp.Ack
+		}
+		if tcp.SYN {
+			e.ack = tcp.Seq + 1
+		}
+		if tcp.PSH {
+			if e.ack == tcp.Seq {
+				e.ack = tcp.Seq + uint32(len(tcp.Payload))
 			}
+		}
+		e.handle = handle
+	})
+
+	// push data if it's not orphan
+	if !orphan && tcp.PSH {
+		select {
+		case conn.chMessage <- message{packet.buf, tcp.Payload, &src}:
+		case <-conn.die:
+			bufferPool.Put(packet.buf)
+			return
 		}
 	}
 }
@@ -194,13 +217,16 @@ func (conn *TCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	case <-conn.die:
 		return 0, nil, io.EOF
 	case packet := <-conn.chMessage:
+		// log.Printf("ReadFrom %d bytes", len(packet.bts))
 		n = copy(p, packet.bts)
+		bufferPool.Put(packet.originBufPtr)
 		return n, packet.addr, nil
 	}
 }
 
 // WriteTo implements the PacketConn WriteTo method.
 func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	// log.Printf("prepare to write to %d bytes", len(p))
 	var deadline <-chan time.Time
 	if d, ok := conn.writeDeadline.Load().(time.Time); ok && !d.IsZero() {
 		timer := time.NewTimer(time.Until(d))
@@ -227,10 +253,17 @@ func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 
 		conn.lockflow(addr, func(e *tcpFlow) {
+			// log.Printf("write to flow %v", addr.String())
 			// if the flow doesn't have handle , assume this packet has lost, without notification
 			if e.handle == nil {
-				n = len(p)
-				return
+				v, ok := handleMap.Load(string(raddr.IP))
+				if ok {
+					e.handle = v.(*net.IPConn)
+				} else {
+					// log.Printf("flow %v has no handle", addr.String())
+					n = len(p)
+					return
+				}
 			}
 
 			// build tcp header with local and remote port
@@ -262,6 +295,7 @@ func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 			e.buf.Clear()
 			gopacket.SerializeLayers(e.buf, conn.opts, &e.tcpHeader, gopacket.Payload(p))
+			// log.Printf("write %d bytes to tcpconn", len(e.buf.Bytes()))
 			if conn.tcpconn != nil {
 				_, err = e.handle.Write(e.buf.Bytes())
 			} else {
@@ -279,6 +313,8 @@ func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 func (conn *TCPConn) Close() error {
 	var err error
 	conn.dieOnce.Do(func() {
+		packetChanMap.Delete(conn.tcpconn.LocalAddr().(*net.TCPAddr).Port)
+
 		// signal closing
 		close(conn.die)
 
@@ -300,8 +336,16 @@ func (conn *TCPConn) Close() error {
 		}
 
 		// close handles
-		for k := range conn.handles {
-			conn.handles[k].Close()
+		connCount, ok := connCountMap[string(conn.remoteIP)]
+		if ok {
+			log.Printf("connCount %v", *connCount)
+			atomic.AddInt32(connCount, -1)
+			if *connCount == 0 {
+				for k := range conn.handles {
+					conn.handles[k].Close()
+				}
+				handleMap.Delete(string(conn.remoteIP))
+			}
 		}
 
 		// delete iptable
@@ -380,6 +424,54 @@ func (conn *TCPConn) SetWriteBuffer(bytes int) error {
 	return err
 }
 
+type packetForChannel struct {
+	tcp *layers.TCP
+	buf *[]byte
+}
+
+var connCountMap = make(map[string]*int32)
+var handleMap = sync.Map{}     // [remoteIP]*net.IPConn
+var packetChanMap = sync.Map{} // [localPort]chan *packetForChannel
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 2048)
+		return &b
+	},
+}
+
+func addHandle(handle *net.IPConn, remoteIP net.IP) {
+	defer handle.Close()
+	defer handleMap.Delete(string(remoteIP))
+	log.Printf("add handle %v", handle.RemoteAddr().String())
+	opt := gopacket.DecodeOptions{NoCopy: true, Lazy: true}
+	for {
+		bufPtr := bufferPool.Get().(*[]byte)
+		buf := *bufPtr
+		n, _, err := handle.ReadFromIP(buf)
+		if err != nil {
+			log.Printf("handle %v error: %s", handle.RemoteAddr().String(), err)
+			return
+		}
+		// log.Printf("recv %v bytes", n)
+		// try decoding TCP frame from buf[:n]
+		packet := gopacket.NewPacket(buf[:n], layers.LayerTypeTCP, opt)
+		transport := packet.TransportLayer()
+		tcp, ok := transport.(*layers.TCP)
+		if !ok {
+			continue
+		}
+		tcpPacketCh := make(chan *packetForChannel, 128)
+		v, ok := packetChanMap.LoadOrStore(int(tcp.DstPort), tcpPacketCh)
+		if !ok {
+			// log.Printf("Add channel for port %v [%v]", tcp.DstPort, tcpPacketCh)
+		} else {
+			tcpPacketCh = v.(chan *packetForChannel)
+		}
+		// log.Printf("send packet to channel %v", tcpPacketCh)
+		tcpPacketCh <- &packetForChannel{tcp, bufPtr}
+	}
+}
+
 // Dial connects to the remote TCP port,
 // and returns a single packet-oriented connection
 func Dial(network, address string) (*TCPConn, error) {
@@ -389,17 +481,40 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	// AF_INET
-	handle, err := net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP})
-	if err != nil {
-		return nil, err
+	v, ok := handleMap.Load(string(raddr.IP))
+	var handle *net.IPConn
+	if !ok {
+		// AF_INET
+		handle, err = net.DialIP("ip:tcp", nil, &net.IPAddr{IP: raddr.IP})
+		if err != nil {
+			return nil, err
+		}
+		handleMap.Store(string(raddr.IP), handle)
+		go addHandle(handle, raddr.IP)
+	} else {
+		handle = v.(*net.IPConn)
 	}
 
 	// create an established tcp connection
 	// will hack this tcp connection for packet transmission
-	tcpconn, err := net.DialTCP(network, nil, raddr)
+	log.Printf("Dialing to %s", raddr.String())
+	dialer := net.Dialer{
+		Timeout: 5 * time.Second, // 设置超时为5秒
+	}
+	c, err := dialer.Dial(network, raddr.String())
 	if err != nil {
 		return nil, err
+	}
+	log.Printf("Dial to %s success", raddr.String())
+	tcpconn := c.(*net.TCPConn)
+	tcpconn.SetKeepAlive(true)
+	srcPort := tcpconn.LocalAddr().(*net.TCPAddr).Port
+	tcpPacketCh := make(chan *packetForChannel, 128)
+	v2, ok := packetChanMap.LoadOrStore(srcPort, tcpPacketCh)
+	if !ok {
+		// log.Printf("Add channel for port %v [%v]", srcPort, tcpPacketCh)
+	} else {
+		tcpPacketCh = v2.(chan *packetForChannel)
 	}
 
 	// fields
@@ -414,8 +529,18 @@ func Dial(network, address string) (*TCPConn, error) {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	go conn.captureFlow(handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
+	conn.tcpPacketCh = tcpPacketCh
+	conn.remoteIP = raddr.IP
+
+	go conn.captureFlowFromChannel(conn.tcpPacketCh, handle, raddr.IP)
 	go conn.cleaner()
+
+	connCount, ok := connCountMap[string(raddr.IP)]
+	if !ok {
+		connCount = new(int32)
+		connCountMap[string(raddr.IP)] = connCount
+	}
+	atomic.AddInt32(connCount, 1)
 
 	// iptables
 	err = setTTL(tcpconn, 1)
@@ -423,28 +548,28 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
-		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
-		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
-			if !exists {
-				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-					conn.iprule = rule
-					conn.iptables = ipt
-				}
-			}
-		}
-	}
-	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
-		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
-		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
-			if !exists {
-				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-					conn.ip6rule = rule
-					conn.ip6tables = ipt
-				}
-			}
-		}
-	}
+	// if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
+	// 	rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+	// 	if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+	// 		if !exists {
+	// 			if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
+	// 				conn.iprule = rule
+	// 				conn.iptables = ipt
+	// 			}
+	// 		}
+	// 	}
+	// }
+	// if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
+	// 	rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+	// 	if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+	// 		if !exists {
+	// 			if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
+	// 				conn.ip6rule = rule
+	// 				conn.ip6tables = ipt
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	// discard everything
 	go io.Copy(ioutil.Discard, tcpconn)
