@@ -109,7 +109,7 @@ func (conn *TCPConn) cleaner() {
 		for k, v := range conn.flowTable {
 			if time.Now().Sub(v.ts) > expire {
 				if v.conn != nil {
-					setTTL(v.conn, 128)
+					setTTL(v.conn, 64)
 					v.conn.Close()
 				}
 				delete(conn.flowTable, k)
@@ -127,6 +127,13 @@ func (conn *TCPConn) captureFlowFromChannel(tcpPacketCh chan *packetForChannel, 
 			// log.Printf("recv packet from channel")
 			conn.handleTCPPacket(handle, packet, remoteIP)
 		case <-conn.die:
+			for {
+				select {
+				case <-tcpPacketCh:
+				default:
+					return
+				}
+			}
 			return
 		}
 	}
@@ -260,10 +267,13 @@ func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 				if ok {
 					e.handle = v.(*net.IPConn)
 				} else {
-					// log.Printf("flow %v has no handle", addr.String())
+					log.Printf("flow %v has no handle", addr.String())
 					n = len(p)
 					return
 				}
+				log.Printf("flow %v has no handle", addr.String())
+				n = len(p)
+				return
 			}
 
 			// build tcp header with local and remote port
@@ -338,7 +348,7 @@ func (conn *TCPConn) Close() error {
 		// close handles
 		connCount, ok := connCountMap[string(conn.remoteIP)]
 		if ok {
-			log.Printf("connCount %v", *connCount)
+			// log.Printf("connCount %v", *connCount)
 			atomic.AddInt32(connCount, -1)
 			if *connCount == 0 {
 				for k := range conn.handles {
@@ -460,14 +470,14 @@ func addHandle(handle *net.IPConn, remoteIP net.IP) {
 		if !ok {
 			continue
 		}
-		tcpPacketCh := make(chan *packetForChannel, 128)
+		tcpPacketCh := make(chan *packetForChannel, 1024)
 		v, ok := packetChanMap.LoadOrStore(int(tcp.DstPort), tcpPacketCh)
 		if !ok {
 			// log.Printf("Add channel for port %v [%v]", tcp.DstPort, tcpPacketCh)
 		} else {
 			tcpPacketCh = v.(chan *packetForChannel)
 		}
-		// log.Printf("send packet to channel %v", tcpPacketCh)
+		// log.Printf("send %d bytes to %d [%v]", n, tcp.DstPort, tcpPacketCh)
 		tcpPacketCh <- &packetForChannel{tcp, bufPtr}
 	}
 }
@@ -497,7 +507,7 @@ func Dial(network, address string) (*TCPConn, error) {
 
 	// create an established tcp connection
 	// will hack this tcp connection for packet transmission
-	log.Printf("Dialing to %s", raddr.String())
+	// log.Printf("Dialing to %s", raddr.String())
 	dialer := net.Dialer{
 		Timeout: 5 * time.Second, // 设置超时为5秒
 	}
@@ -505,9 +515,8 @@ func Dial(network, address string) (*TCPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Dial to %s success", raddr.String())
+	// log.Printf("Dial to %s success", raddr.String())
 	tcpconn := c.(*net.TCPConn)
-	tcpconn.SetKeepAlive(true)
 	srcPort := tcpconn.LocalAddr().(*net.TCPAddr).Port
 	tcpPacketCh := make(chan *packetForChannel, 128)
 	v2, ok := packetChanMap.LoadOrStore(srcPort, tcpPacketCh)
@@ -548,28 +557,28 @@ func Dial(network, address string) (*TCPConn, error) {
 		return nil, err
 	}
 
-	// if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
-	// 	rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
-	// 	if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
-	// 		if !exists {
-	// 			if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-	// 				conn.iprule = rule
-	// 				conn.iptables = ipt
-	// 			}
-	// 		}
-	// 	}
-	// }
-	// if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
-	// 	rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
-	// 	if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
-	// 		if !exists {
-	// 			if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
-	// 				conn.ip6rule = rule
-	// 				conn.ip6tables = ipt
-	// 			}
-	// 		}
-	// 	}
-	// }
+	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4); err == nil {
+		rule := []string{"-m", "ttl", "--ttl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+			if !exists {
+				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
+					conn.iprule = rule
+					conn.iptables = ipt
+				}
+			}
+		}
+	}
+	if ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err == nil {
+		rule := []string{"-m", "hl", "--hl-eq", "1", "-p", "tcp", "-d", raddr.IP.String(), "--dport", fmt.Sprint(raddr.Port), "-j", "DROP"}
+		if exists, err := ipt.Exists("filter", "OUTPUT", rule...); err == nil {
+			if !exists {
+				if err = ipt.Append("filter", "OUTPUT", rule...); err == nil {
+					conn.ip6rule = rule
+					conn.ip6tables = ipt
+				}
+			}
+		}
+	}
 
 	// discard everything
 	go io.Copy(ioutil.Discard, tcpconn)
