@@ -470,16 +470,38 @@ func addHandle(handle *net.IPConn, remoteIP net.IP) {
 		if !ok {
 			continue
 		}
-		tcpPacketCh := make(chan *packetForChannel, 1024)
-		v, ok := packetChanMap.LoadOrStore(int(tcp.DstPort), tcpPacketCh)
+		v, ok := packetChanMap.Load(int(tcp.DstPort))
 		if !ok {
-			// log.Printf("Add channel for port %v [%v]", tcp.DstPort, tcpPacketCh)
-		} else {
-			tcpPacketCh = v.(chan *packetForChannel)
+			// log.Printf("no channel for port %v", tcp.DstPort)
+			bufferPool.Put(bufPtr)
+			continue
 		}
+		tcpPacketCh := v.(chan *packetForChannel)
+		// tcpPacketCh := make(chan *packetForChannel, 256)
+		// v, ok := packetChanMap.LoadOrStore(int(tcp.DstPort), tcpPacketCh)
+		// if !ok {
+		// log.Printf("Add channel for port %v [%v]", tcp.DstPort, tcpPacketCh)
+		// } else {
+		// 	tcpPacketCh = v.(chan *packetForChannel)
+		// }
 		// log.Printf("send %d bytes to %d [%v]", n, tcp.DstPort, tcpPacketCh)
-		tcpPacketCh <- &packetForChannel{tcp, bufPtr}
+		select {
+		case tcpPacketCh <- &packetForChannel{tcp, bufPtr}:
+		default:
+			bufferPool.Put(bufPtr)
+			log.Printf("channel for port %v is full", tcp.DstPort)
+		}
 	}
+}
+
+func findAvailableTCPAddr() *net.TCPAddr {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer l.Close()
+	addr := l.Addr().(*net.TCPAddr)
+	return addr
 }
 
 // Dial connects to the remote TCP port,
@@ -508,23 +530,26 @@ func Dial(network, address string) (*TCPConn, error) {
 	// create an established tcp connection
 	// will hack this tcp connection for packet transmission
 	// log.Printf("Dialing to %s", raddr.String())
-	dialer := net.Dialer{
-		Timeout: 5 * time.Second, // 设置超时为5秒
-	}
-	c, err := dialer.Dial(network, raddr.String())
+	// dialer := net.Dialer{
+	// 	Timeout: 5 * time.Second, // 设置超时为5秒
+	// }
+	localAddr := findAvailableTCPAddr()
+	tcpPacketCh := make(chan *packetForChannel, 256)
+	packetChanMap.Store(localAddr.Port, tcpPacketCh)
+	tcpconn, err := net.DialTCP("tcp", localAddr, raddr)
+	// c, err := dialer.Dial(network, raddr.String())
 	if err != nil {
 		return nil, err
 	}
 	// log.Printf("Dial to %s success", raddr.String())
-	tcpconn := c.(*net.TCPConn)
-	srcPort := tcpconn.LocalAddr().(*net.TCPAddr).Port
-	tcpPacketCh := make(chan *packetForChannel, 128)
-	v2, ok := packetChanMap.LoadOrStore(srcPort, tcpPacketCh)
-	if !ok {
-		// log.Printf("Add channel for port %v [%v]", srcPort, tcpPacketCh)
-	} else {
-		tcpPacketCh = v2.(chan *packetForChannel)
-	}
+	// tcpconn := c
+	// srcPort := tcpconn.LocalAddr().(*net.TCPAddr).Port
+	// v2, ok := packetChanMap.LoadOrStore(srcPort, tcpPacketCh)
+	// if !ok {
+	// log.Printf("Add channel for port %v [%v]", srcPort, tcpPacketCh)
+	// } else {
+	// 	tcpPacketCh = v2.(chan *packetForChannel)
+	// }
 
 	// fields
 	conn := new(TCPConn)
