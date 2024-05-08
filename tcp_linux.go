@@ -127,13 +127,14 @@ func (conn *TCPConn) captureFlowFromChannel(tcpPacketCh chan *packetForChannel, 
 			// log.Printf("recv packet from channel")
 			conn.handleTCPPacket(handle, packet, remoteIP)
 		case <-conn.die:
-			for {
-				select {
-				case <-tcpPacketCh:
-				default:
-					return
-				}
-			}
+			close(tcpPacketCh)
+			// for {
+			// 	select {
+			// 	case <-tcpPacketCh:
+			// 	default:
+			// 		return
+			// 	}
+			// }
 			return
 		}
 	}
@@ -168,6 +169,9 @@ func (conn *TCPConn) captureFlow(handle *net.IPConn, port int) {
 }
 
 func (conn *TCPConn) handleTCPPacket(handle *net.IPConn, packet *packetForChannel, remoteIP net.IP) {
+	if packet == nil {
+		return
+	}
 	tcp := packet.tcp
 	// address building
 	var src net.TCPAddr
@@ -212,38 +216,68 @@ func (conn *TCPConn) handleTCPPacket(handle *net.IPConn, packet *packetForChanne
 func (conn *TCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	var timer *time.Timer
 	var deadline <-chan time.Time
-	if d, ok := conn.readDeadline.Load().(time.Time); ok && !d.IsZero() {
-		timer = time.NewTimer(time.Until(d))
+	d := conn.readDeadline.Load()
+	if d != nil {
+		t := d.(time.Time)
+		timer = time.NewTimer(time.Until(t))
 		defer timer.Stop()
 		deadline = timer.C
 	}
+	// if d, ok := conn.readDeadline.Load().(time.Time); ok && !d.IsZero() {
+	// 	timer = time.NewTimer(time.Until(d))
+	// 	defer timer.Stop()
+	// 	deadline = timer.C
+	// }
 
-	select {
-	case <-deadline:
-		return 0, nil, errTimeout
-	case <-conn.die:
-		return 0, nil, io.EOF
-	case packet := <-conn.chMessage:
-		// log.Printf("ReadFrom %d bytes", len(packet.bts))
-		n = copy(p, packet.bts)
-		bufferPool.Put(packet.originBufPtr)
-		return n, packet.addr, nil
+	for {
+		select {
+		case <-deadline:
+			d := conn.readDeadline.Load()
+			if d != nil {
+				t := d.(time.Time)
+				if time.Now().After(t) {
+					return 0, nil, errTimeout
+				} else {
+					timer.Reset(time.Until(t))
+				}
+			}
+		case <-conn.die:
+			return 0, nil, io.EOF
+		case packet := <-conn.chMessage:
+			// log.Printf("ReadFrom %d bytes", len(packet.bts))
+			n = copy(p, packet.bts)
+			bufferPool.Put(packet.originBufPtr)
+			return n, packet.addr, nil
+		}
 	}
 }
 
 // WriteTo implements the PacketConn WriteTo method.
 func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	// log.Printf("prepare to write to %d bytes", len(p))
+	var timer *time.Timer
 	var deadline <-chan time.Time
-	if d, ok := conn.writeDeadline.Load().(time.Time); ok && !d.IsZero() {
-		timer := time.NewTimer(time.Until(d))
+	d := conn.writeDeadline.Load()
+	if d != nil {
+		t := d.(time.Time)
+		timer = time.NewTimer(time.Until(t))
 		defer timer.Stop()
 		deadline = timer.C
 	}
 
+SELECT:
 	select {
 	case <-deadline:
-		return 0, errTimeout
+		d := conn.writeDeadline.Load()
+		if d != nil {
+			t := d.(time.Time)
+			if time.Now().After(t) {
+				return 0, errTimeout
+			} else {
+				timer.Reset(time.Until(t))
+				goto SELECT
+			}
+		}
 	case <-conn.die:
 		return 0, io.EOF
 	default:
@@ -497,7 +531,8 @@ func addHandle(handle *net.IPConn, remoteIP net.IP) {
 func findAvailableTCPAddr() *net.TCPAddr {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("failed to find available tcp addr: %v", err)
+		return nil
 	}
 	defer l.Close()
 	addr := l.Addr().(*net.TCPAddr)
@@ -533,12 +568,31 @@ func Dial(network, address string) (*TCPConn, error) {
 	// dialer := net.Dialer{
 	// 	Timeout: 5 * time.Second, // 设置超时为5秒
 	// }
-	localAddr := findAvailableTCPAddr()
-	tcpPacketCh := make(chan *packetForChannel, 256)
-	packetChanMap.Store(localAddr.Port, tcpPacketCh)
-	tcpconn, err := net.DialTCP("tcp", localAddr, raddr)
-	// c, err := dialer.Dial(network, raddr.String())
-	if err != nil {
+	var tcpconn *net.TCPConn
+	var tcpPacketCh chan *packetForChannel
+	for i := 0; i < 3; i++ {
+		localAddr := findAvailableTCPAddr()
+		if localAddr == nil {
+			continue
+		}
+		ch := make(chan *packetForChannel, 256)
+		packetChanMap.Store(localAddr.Port, ch)
+		dialer := net.Dialer{
+			Timeout:   5 * time.Second, // 设置超时时间为5秒
+			LocalAddr: localAddr,
+		}
+		c, err := dialer.Dial(network, raddr.String())
+		if err != nil {
+			log.Printf("Dial to %s failed: %v", raddr.String(), err)
+			packetChanMap.Delete(localAddr.Port)
+			close(ch)
+			continue
+		}
+		tcpconn = c.(*net.TCPConn)
+		tcpPacketCh = ch
+		break
+	}
+	if tcpconn == nil {
 		return nil, err
 	}
 	// log.Printf("Dial to %s success", raddr.String())

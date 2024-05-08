@@ -1,6 +1,6 @@
 module github.com/fregie/tcpraw
 
-go 1.22.1
+go 1.21
 
 require (
 	github.com/coreos/go-iptables v0.7.0
