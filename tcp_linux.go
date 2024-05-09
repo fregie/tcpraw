@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"sync"
@@ -100,22 +99,25 @@ func (conn *TCPConn) lockflow(addr net.Addr, f func(e *tcpFlow)) {
 
 // clean expired flows
 func (conn *TCPConn) cleaner() {
-	ticker := time.NewTicker(time.Minute)
-	select {
-	case <-conn.die:
-		return
-	case <-ticker.C:
-		conn.flowsLock.Lock()
-		for k, v := range conn.flowTable {
-			if time.Now().Sub(v.ts) > expire {
-				if v.conn != nil {
-					setTTL(v.conn, 64)
-					v.conn.Close()
+	ticker := time.NewTicker(5 * time.Second)
+	for {
+		select {
+		case <-conn.die:
+			return
+		case <-ticker.C:
+			conn.flowsLock.Lock()
+			for k, v := range conn.flowTable {
+				if time.Since(v.ts) > 10*time.Second {
+					if v.conn != nil {
+						// log.Printf("Close connection: %s", v.conn.RemoteAddr().String())
+						setTTL(v.conn, 64)
+						v.conn.Close()
+					}
+					delete(conn.flowTable, k)
 				}
-				delete(conn.flowTable, k)
 			}
+			conn.flowsLock.Unlock()
 		}
-		conn.flowsLock.Unlock()
 	}
 }
 
@@ -186,7 +188,6 @@ func (conn *TCPConn) handleTCPPacket(handle *net.IPConn, packet *packetForChanne
 		}
 
 		// to keep track of TCP header related to this source
-		e.ts = time.Now()
 		if tcp.ACK {
 			e.seq = tcp.Ack
 		}
@@ -194,6 +195,7 @@ func (conn *TCPConn) handleTCPPacket(handle *net.IPConn, packet *packetForChanne
 			e.ack = tcp.Seq + 1
 		}
 		if tcp.PSH {
+			e.ts = time.Now()
 			if e.ack == tcp.Seq {
 				e.ack = tcp.Seq + uint32(len(tcp.Payload))
 			}
@@ -349,6 +351,7 @@ SELECT:
 			}
 			// increase seq in flow
 			e.seq += uint32(len(p))
+			e.ts = time.Now()
 			n = len(p)
 		})
 	}
@@ -663,7 +666,8 @@ func Dial(network, address string) (*TCPConn, error) {
 
 	// discard everything
 	go func() {
-		io.Copy(ioutil.Discard, tcpconn)
+		io.Copy(io.Discard, tcpconn)
+		setTTL(tcpconn, 64)
 		conn.Close()
 	}()
 
@@ -778,7 +782,11 @@ func Listen(network, address string) (*TCPConn, error) {
 			conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn })
 
 			// discard everything
-			go io.Copy(ioutil.Discard, tcpconn)
+			go func() {
+				io.Copy(io.Discard, tcpconn)
+				setTTL(tcpconn, 64)
+				tcpconn.Close()
+			}()
 		}
 	}()
 
