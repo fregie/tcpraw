@@ -214,32 +214,33 @@ func (conn *TCPConn) handleTCPPacket(handle *net.IPConn, packet *packetForChanne
 
 // ReadFrom implements the PacketConn ReadFrom method.
 func (conn *TCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	var timer *time.Timer
-	var deadline <-chan time.Time
+	deadlineTimer := time.NewTimer(5 * time.Second)
+	defer deadlineTimer.Stop()
 	d := conn.readDeadline.Load()
 	if d != nil {
 		t := d.(time.Time)
-		timer = time.NewTimer(time.Until(t))
-		defer timer.Stop()
-		deadline = timer.C
+		deadlineTimer.Reset(time.Until(t))
 	}
 	// if d, ok := conn.readDeadline.Load().(time.Time); ok && !d.IsZero() {
 	// 	timer = time.NewTimer(time.Until(d))
 	// 	defer timer.Stop()
 	// 	deadline = timer.C
 	// }
-
 	for {
 		select {
-		case <-deadline:
+		case <-deadlineTimer.C:
 			d := conn.readDeadline.Load()
 			if d != nil {
 				t := d.(time.Time)
 				if time.Now().After(t) {
 					return 0, nil, errTimeout
 				} else {
-					timer.Reset(time.Until(t))
+					deadlineTimer.Reset(time.Until(t))
+					continue
 				}
+			} else {
+				deadlineTimer.Reset(5 * time.Second)
+				continue
 			}
 		case <-conn.die:
 			return 0, nil, io.EOF
@@ -255,28 +256,29 @@ func (conn *TCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 // WriteTo implements the PacketConn WriteTo method.
 func (conn *TCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	// log.Printf("prepare to write to %d bytes", len(p))
-	var timer *time.Timer
-	var deadline <-chan time.Time
+	deadlineTimer := time.NewTimer(5 * time.Second)
+	defer deadlineTimer.Stop()
 	d := conn.writeDeadline.Load()
 	if d != nil {
 		t := d.(time.Time)
-		timer = time.NewTimer(time.Until(t))
-		defer timer.Stop()
-		deadline = timer.C
+		deadlineTimer.Reset(time.Until(t))
 	}
 
 SELECT:
 	select {
-	case <-deadline:
+	case <-deadlineTimer.C:
 		d := conn.writeDeadline.Load()
 		if d != nil {
 			t := d.(time.Time)
 			if time.Now().After(t) {
 				return 0, errTimeout
 			} else {
-				timer.Reset(time.Until(t))
+				deadlineTimer.Reset(time.Until(t))
 				goto SELECT
 			}
+		} else {
+			deadlineTimer.Reset(5 * time.Second)
+			goto SELECT
 		}
 	case <-conn.die:
 		return 0, io.EOF
@@ -357,13 +359,12 @@ SELECT:
 func (conn *TCPConn) Close() error {
 	var err error
 	conn.dieOnce.Do(func() {
-		packetChanMap.Delete(conn.tcpconn.LocalAddr().(*net.TCPAddr).Port)
-
 		// signal closing
 		close(conn.die)
 
 		// close all established tcp connections
 		if conn.tcpconn != nil { // client
+			packetChanMap.Delete(conn.tcpconn.LocalAddr().(*net.TCPAddr).Port)
 			setTTL(conn.tcpconn, 64)
 			err = conn.tcpconn.Close()
 		} else if conn.listener != nil {
@@ -385,10 +386,10 @@ func (conn *TCPConn) Close() error {
 			// log.Printf("connCount %v", *connCount)
 			atomic.AddInt32(connCount, -1)
 			if *connCount == 0 {
-				for k := range conn.handles {
-					conn.handles[k].Close()
-				}
-				handleMap.Delete(string(conn.remoteIP))
+				// for k := range conn.handles {
+				// 	conn.handles[k].Close()
+				// }
+				// handleMap.Delete(string(conn.remoteIP))
 			}
 		}
 
@@ -589,11 +590,12 @@ func Dial(network, address string) (*TCPConn, error) {
 			continue
 		}
 		tcpconn = c.(*net.TCPConn)
+		tcpconn.SetKeepAlive(true)
 		tcpPacketCh = ch
 		break
 	}
 	if tcpconn == nil {
-		return nil, err
+		return nil, fmt.Errorf("Dial to %s failed", raddr.String())
 	}
 	// log.Printf("Dial to %s success", raddr.String())
 	// tcpconn := c
@@ -660,7 +662,10 @@ func Dial(network, address string) (*TCPConn, error) {
 	}
 
 	// discard everything
-	go io.Copy(ioutil.Discard, tcpconn)
+	go func() {
+		io.Copy(ioutil.Discard, tcpconn)
+		conn.Close()
+	}()
 
 	return conn, nil
 }
@@ -767,7 +772,8 @@ func Listen(network, address string) (*TCPConn, error) {
 			if err := setTTL(tcpconn, 1); err != nil {
 				panic(err)
 			}
-
+			tcpconn.SetKeepAlive(true)
+			tcpconn.SetKeepAlivePeriod(60 * time.Second)
 			// record net.Conn
 			conn.lockflow(tcpconn.RemoteAddr(), func(e *tcpFlow) { e.conn = tcpconn })
 
